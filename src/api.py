@@ -1,67 +1,90 @@
-from fastapi import FastAPI     # framework tạo API
-from pydantic import BaseModel  # Kiểm tra dữ liệu đầu vào
-import joblib                   # Thư viện để load model đã được huấn luyện sẵn
-import pandas as pd             # Thư viện xử lý dữ liệu dạng bảng
-import numpy as np              # Thư viện xử lý dữ liệu dạng mảng
-import csv                      # Thư viện để ghi log vào file CSV
-import os                       # Thư viện để kiểm tra sự tồn tại của file
-from datetime import datetime   # Thư viện để lấy thời gian hiện tại
+from fastapi import FastAPI             # 1. Import FastAPI để tạo ứng dụng web
+from pydantic import BaseModel, Field   # 2. Import BaseModel để định nghĩa dữ liệu đầu vào, Field để thêm mô tả
+import joblib                           # 3. Import joblib để load model đã được train
+import pandas as pd                     # 4. Import pandas để xử lý dữ liệu dạng DataFrame
+from pathlib import Path                # 5. Import Path để làm việc với đường dẫn file
+import csv                              # 6. Import csv để ghi log lịch sử dự đoán
+import os                               # 7. Import os để làm việc với hệ thống file
+from datetime import datetime           # 8. Import datetime để ghi thời gian dự đoán
+from fastapi.responses import HTMLResponse      # 9. Import HTMLResponse để trả về trang HTML
+from fastapi.templating import Jinja2Templates  # 10. Import Jinja2Templates để sử dụng template HTML
+from fastapi import Request                     # 11. Import Request để xử lý yêu cầu từ client
 
 # 1. Khởi tạo app
 app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
 # 2. Load model từ Dev 1 tạo ra
 model = joblib.load("models/model.pkl")
 
 # 3. Định nghĩa dữ liệu đầu vào
-class InputData(BaseModel):
-    thu_nhap: float
-    so_tien_vay: float
-    thoi_han_vay: int
-    diem_tin_dung: int
+class PredictRequest(BaseModel):
+    thu_nhap: float = Field(..., ge=0)
+    so_tien_vay: float = Field(..., ge=0)
+    thoi_han_vay: int = Field(..., ge=6, le=60)    # Kỳ hạn thực tế từ 6 đến 60 tháng
+    diem_tin_dung: int = Field(..., ge=300, le=850) # Điểm tín dụng thực tế từ 300 đến 850
 
 # 4. Endpoint dự đoán
 @app.post("/predict")
-def predict(data: InputData):
+def predict(request: PredictRequest):
 
     # Tính lãi suất năm và lãi suất tháng dựa trên điểm tín dụng của người dùng
-    lai_suat_nam = 0.08 + (1 - (data.diem_tin_dung / 850)) * 0.15 
+    lai_suat_nam = 0.08 + (1 - (request.diem_tin_dung / 850)) * 0.15 
     lai_suat_thang = lai_suat_nam / 12
 
     # Tính số tiền trả hàng tháng (EMI)
-    tks = (1 + lai_suat_thang) ** data.thoi_han_vay
-    tra_hang_thang = data.so_tien_vay * lai_suat_thang * tks / (tks - 1)
+    tks = (1 + lai_suat_thang) ** request.thoi_han_vay
+    tra_hang_thang = request.so_tien_vay * lai_suat_thang * tks / (tks - 1)
 
     # Tạo bảng mới, gom đủ 5 cột
-    input_df = pd.DataFrame([{
-        'thu_nhap': int(data.thu_nhap),
-        'so_tien_vay': int(data.so_tien_vay),
-        'thoi_han_vay': int(data.thoi_han_vay),
-        'diem_tin_dung': int(data.diem_tin_dung),
-        'tra_hang_thang': int(tra_hang_thang)  # 🌟 Cột hệ thống vừa tự tính ở Phần 2
+    input_data = pd.DataFrame([{
+        'thu_nhap': int(request.thu_nhap),
+        'so_tien_vay': int(request.so_tien_vay),
+        'thoi_han_vay': int(request.thoi_han_vay),
+        'diem_tin_dung': int(request.diem_tin_dung),
+        'tra_hang_thang': int(tra_hang_thang)
     }])
 
     # 5. Tiến hành dự đoán nợ xấu (0: Tốt, 1: Nợ xấu)
-    ket_qua = model.predict(input_df)[0]
+    prediction = model.predict(input_data)[0]
 
     # 6. Ghi log lịch sử dự đoán
-    log_path = "logs/inference_logs.csv"
-    os.makedirs("logs", exist_ok=True) # Đảm bảo thư mục logs tồn tại
-    file_exists = os.path.exists(log_path)
-    
-    with open(log_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["thoi_gian", "thu_nhap", "so_tien_vay", "thoi_han_vay", "diem_tin_dung", "tra_hang_thang", "ket_qua"])
+    Path("logs").mkdir(exist_ok=True)
+    log_file = "logs/inference_logs.csv"
+
+    file_exists = Path(log_file).exists()
+    file_empty = not file_exists or Path(log_file).stat().st_size == 0
+
+    with open(log_file, "a", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        if file_empty:
+            writer.writerow([
+                "timestamp", "thu_nhap", "so_tien_vay", 
+                "thoi_han_vay", "diem_tin_dung", "tra_hang_thang", "prediction"
+            ])
         writer.writerow([
             datetime.now(), 
-            data.thu_nhap, 
-            data.so_tien_vay, 
-            data.thoi_han_vay, 
-            data.diem_tin_dung, 
+            request.thu_nhap, 
+            request.so_tien_vay,   
+            request.thoi_han_vay, 
+            request.diem_tin_dung, 
             int(tra_hang_thang), 
-            ket_qua
+            int(prediction)
         ])
 
     # 7. Trả về kết quả
-    return {"ket_qua_du_doan": int(ket_qua)}
+    return {
+        "prediction": int(prediction)
+    }
+
+# KẾT THÚC XÂY HÀM PREDICT CHO FASTAPI
+
+# FRONTEND
+# =========================
+
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    return templates.TemplateResponse(
+    request=request,
+    name="index.html"
+)
